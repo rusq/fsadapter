@@ -15,4 +15,4 @@ Each adapter exposes the following methods:
 - WriteFile(name string, data []byte, perm os.FileMode) error
 - Close() error
 
-It is meant to be a drop-in replacement for os.* functions for [Slackdump](github.com/rusq/slackdump).
+It is meant to be a drop-in replacement for os.* functions for [Slackdump](https://github.com/rusq/slackdump).
