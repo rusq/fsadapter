@@ -3,6 +3,7 @@ package fsadapter
 import (
 	"archive/zip"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -84,7 +86,7 @@ func (z *ZIP) ensureDir(filename string) error {
 	if z.seen == nil {
 		z.seen = make(map[string]bool, 0)
 	}
-	var ensureFn = func(dir string) error {
+	ensureFn := func(dir string) error {
 		if _, seen := z.seen[dir]; seen {
 			return nil
 		}
@@ -134,7 +136,6 @@ func (z *ZIP) WriteFile(filename string, data []byte, _ os.FileMode) error {
 
 	_, err = io.Copy(zf, bytes.NewReader(data))
 	return err
-
 }
 
 // Close closes the underlying zip writer and the file handle.  It is only
@@ -176,14 +177,22 @@ type syncWriter struct {
 	//
 	// From zip.Create doc:  The file's contents must be written to the
 	// io.Writer before the next call to Create, CreateHeader, or Close.
-	mu *sync.Mutex
+	mu     *sync.Mutex
+	closed atomic.Bool
 }
 
 func (sw *syncWriter) Write(p []byte) (int, error) {
+	if sw.closed.Load() {
+		return 0, errors.New("file already closed")
+	}
 	return sw.w.Write(p)
 }
 
 func (sw *syncWriter) Close() error {
+	if sw.closed.Load() {
+		return nil
+	}
 	sw.mu.Unlock()
+	sw.closed.Store(true)
 	return nil
 }
