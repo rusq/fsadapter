@@ -131,17 +131,6 @@ func RandString(sz int) string {
 	return string(ret)
 }
 
-func Test_syncWriter_Close(t *testing.T) {
-	t.Run("should unlock the mutex", func(t *testing.T) {
-		sw := syncWriter{mu: &sync.Mutex{}}
-
-		sw.mu.Lock()
-
-		sw.Close()
-		assert.True(t, sw.mu.TryLock())
-	})
-}
-
 func TestNewZIP(t *testing.T) {
 	tmpdir := t.TempDir()
 	t.Run("ensure it's the same zw", func(t *testing.T) {
@@ -279,4 +268,22 @@ func TestZIP_dirpath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_syncWriter_Close(t *testing.T) {
+	t.Run("should unlock the mutex", func(t *testing.T) {
+		sw := syncWriter{mu: &sync.Mutex{}}
+
+		sw.mu.Lock()
+
+		sw.Close()
+		assert.True(t, sw.mu.TryLock())
+		assert.True(t, sw.closed.Load())
+	})
+	t.Run("closing more than once does not panic", func(_ *testing.T) {
+		sw := syncWriter{mu: &sync.Mutex{}}
+		sw.mu.Lock()
+		sw.Close()
+		sw.Close()
+	})
 }
