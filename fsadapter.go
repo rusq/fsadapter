@@ -8,14 +8,14 @@ import (
 )
 
 // FS is interface for operating on the files of the underlying filesystem.
-//
-//go:generate mockgen -destination ../internal/mocks/mock_fsadapter/mock_fs.go github.com/rusq/slackdump/v2/fsadapter FS
 type FS interface {
 	Create(string) (io.WriteCloser, error)
 	WriteFile(name string, data []byte, perm os.FileMode) error
 }
 
 // FSCloser is a FS that can be closed.
+//
+//go:generate mockgen -destination mocks/mock_fsadapter/mock_fs.go github.com/rusq/fsadapter FSCloser
 type FSCloser interface {
 	FS
 	io.Closer
