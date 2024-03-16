@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-var _ FS = Directory{}
+var _ FSCloser = Directory{}
 
 type Directory struct {
 	dir string

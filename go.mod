@@ -2,7 +2,10 @@ module github.com/rusq/fsadapter
 
 go 1.19
 
-require github.com/stretchr/testify v1.8.1
+require (
+	github.com/stretchr/testify v1.8.1
+	go.uber.org/mock v0.4.0
+)
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect

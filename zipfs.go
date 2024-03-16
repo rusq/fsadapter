@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-var _ FS = &ZIP{}
+var _ FSCloser = &ZIP{}
 
 // ZIP is a filesystem adapter for zip files.
 type ZIP struct {
