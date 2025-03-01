@@ -141,7 +141,7 @@ func TestDirectory_ensureSubdir(t *testing.T) {
 func Test_mkdirAll(t *testing.T) {
 	tmpdir := t.TempDir()
 	existingFile := filepath.Join(tmpdir, "existing.txt")
-	if err := os.WriteFile(existingFile, []byte("123"), 0640); err != nil {
+	if err := os.WriteFile(existingFile, []byte("123"), 0o640); err != nil {
 		t.Fatal(err)
 	}
 
@@ -202,13 +202,13 @@ func TestDirectory_WriteFile(t *testing.T) {
 		{
 			"all ok",
 			fields{dir: tmpdir},
-			args{"blah.txt", []byte("blah"), 0640},
+			args{"blah.txt", []byte("blah"), 0o640},
 			false,
 		},
 		{
 			"outside of base path is an error",
 			fields{dir: tmpdir},
-			args{filepath.Join("..", "blah.txt"), []byte("blah"), 0640},
+			args{filepath.Join("..", "blah.txt"), []byte("blah"), 0o640},
 			true,
 		},
 	}
