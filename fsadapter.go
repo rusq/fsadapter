@@ -23,11 +23,16 @@ type FSCloser interface {
 
 // New returns appropriate filesystem based on the name of the location.
 // Logic is simple:
+//   - if location is "/dev/null", NOP adapter is returned.
 //   - if location has a known extension, the appropriate adapter is returned.
 //   - else: it's a directory.
 //
 // Currently supported extensions: ".zip" (case insensitive)
 func New(location string) (FSCloser, error) {
+	if location == os.DevNull {
+		// may be useful for testing.
+		return NewNOP(), nil
+	}
 	switch strings.ToUpper(filepath.Ext(location)) {
 	case ".ZIP":
 		return NewZipFile(location)
