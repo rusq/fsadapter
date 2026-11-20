@@ -10,6 +10,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// symlinkFixture creates a base directory and an outside directory, and a
+// symlink "link" inside the base directory, pointing to target (relative to
+// the base directory, or absolute).  It returns the base and outside dirs.
+func symlinkFixture(t *testing.T, target func(base, outside string) string) (base, outside string) {
+	t.Helper()
+	base, outside = t.TempDir(), t.TempDir()
+	if err := os.Symlink(target(base, outside), filepath.Join(base, "link")); err != nil {
+		t.Skipf("symlinks not supported: %v", err)
+	}
+	return base, outside
+}
+
+func toOutside(_, outside string) string { return outside }
+
 func TestDirectory_Create(t *testing.T) {
 	tmpdir := t.TempDir()
 	type fields struct {
@@ -92,6 +106,91 @@ func TestDirectory_Create(t *testing.T) {
 			assert.Equal(tt.testData, fileData)
 		})
 	}
+
+	t.Run("symlinked parent outside of root directory", func(t *testing.T) {
+		base, outside := symlinkFixture(t, toOutside)
+		f, err := NewDirectory(base).Create(filepath.Join("link", "authorized_keys"))
+		if err == nil {
+			f.Close()
+		}
+		assert.Error(t, err)
+		assert.NoFileExists(t, filepath.Join(outside, "authorized_keys"))
+	})
+	t.Run("symlinked parent outside of root, nested subdirectory", func(t *testing.T) {
+		base, outside := symlinkFixture(t, toOutside)
+		f, err := NewDirectory(base).Create(filepath.Join("link", "sub", "file.txt"))
+		if err == nil {
+			f.Close()
+		}
+		assert.Error(t, err)
+		assert.NoDirExists(t, filepath.Join(outside, "sub"))
+	})
+	t.Run("dangling file symlink outside of root directory", func(t *testing.T) {
+		base, outside := symlinkFixture(t, func(_, outside string) string {
+			return filepath.Join(outside, "target.txt")
+		})
+		f, err := NewDirectory(base).Create("link")
+		if err == nil {
+			f.Close()
+		}
+		assert.Error(t, err)
+		assert.NoFileExists(t, filepath.Join(outside, "target.txt"))
+	})
+	t.Run("symlink within root directory is allowed", func(t *testing.T) {
+		base, _ := symlinkFixture(t, func(base, _ string) string {
+			dir := filepath.Join(base, "real")
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			return "real"
+		})
+		f, err := NewDirectory(base).Create(filepath.Join("link", "file.txt"))
+		require.NoError(t, err)
+		_, err = f.Write([]byte("123"))
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		assert.FileExists(t, filepath.Join(base, "real", "file.txt"))
+	})
+	t.Run("absolute symlink within root directory is rejected", func(t *testing.T) {
+		base, _ := symlinkFixture(t, func(base, _ string) string {
+			dir := filepath.Join(base, "real")
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			return dir
+		})
+		f, err := NewDirectory(base).Create(filepath.Join("link", "file.txt"))
+		if err == nil {
+			f.Close()
+		}
+		assert.Error(t, err)
+		assert.NoFileExists(t, filepath.Join(base, "real", "file.txt"))
+	})
+	t.Run("empty directory is the current directory", func(t *testing.T) {
+		base := t.TempDir()
+		t.Chdir(base)
+		f, err := NewDirectory("").Create("file.txt")
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		assert.FileExists(t, filepath.Join(base, "file.txt"))
+	})
+	t.Run("unclean directory is cleaned", func(t *testing.T) {
+		base := t.TempDir()
+		if err := os.WriteFile(filepath.Join(base, "notadir"), nil, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		f, err := NewDirectory(filepath.Join(base, "notadir") + "/../out").Create("file.txt")
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		assert.FileExists(t, filepath.Join(base, "out", "file.txt"))
+	})
+	t.Run("creates missing root directory", func(t *testing.T) {
+		base := filepath.Join(t.TempDir(), "new", "root")
+		f, err := NewDirectory(base).Create("file.txt")
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		assert.FileExists(t, filepath.Join(base, "file.txt"))
+	})
 }
 
 func TestDirectory_ensureSubdir(t *testing.T) {
@@ -232,4 +331,19 @@ func TestDirectory_WriteFile(t *testing.T) {
 			assert.Equal(t, tt.args.data, data)
 		})
 	}
+
+	t.Run("symlinked parent outside of root directory", func(t *testing.T) {
+		base, outside := symlinkFixture(t, toOutside)
+		err := NewDirectory(base).WriteFile(filepath.Join("link", "blah.txt"), []byte("blah"), 0o640)
+		assert.Error(t, err)
+		assert.NoFileExists(t, filepath.Join(outside, "blah.txt"))
+	})
+	t.Run("non-permission mode bits are ignored", func(t *testing.T) {
+		base := t.TempDir()
+		err := NewDirectory(base).WriteFile("blah.txt", []byte("blah"), 0o640|os.ModeTemporary)
+		require.NoError(t, err)
+		fi, err := os.Stat(filepath.Join(base, "blah.txt"))
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0), fi.Mode()&^os.ModePerm)
+	})
 }
