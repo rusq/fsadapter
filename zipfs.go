@@ -56,13 +56,21 @@ func normalizeZIPPath(name string) (string, bool, error) {
 	slashed := strings.ReplaceAll(name, `\`, "/")
 	directory := strings.HasSuffix(slashed, "/")
 	clean := path.Clean(slashed)
-	if strings.HasPrefix(slashed, "/") || strings.ContainsRune(name, 0) ||
-		hasDrivePrefix(slashed) || hasDrivePrefix(clean) {
-		return "", false, invalidZIPPath(name)
+	switch {
+	case strings.HasPrefix(slashed, "/"):
+		return "", false, invalidZIPPath(name, "rooted path")
+	case strings.ContainsRune(name, 0):
+		return "", false, invalidZIPPath(name, "path contains a NUL byte")
+	case hasDrivePrefix(slashed) || hasDrivePrefix(clean):
+		return "", false, invalidZIPPath(name, "drive-qualified path")
+	case clean == ".":
+		return "", false, invalidZIPPath(name, "path resolves to the archive root")
+	case clean == ".." || strings.HasPrefix(clean, "../"):
+		return "", false, invalidZIPPath(name, "path escapes the archive root")
 	}
 	for _, component := range strings.Split(clean, "/") {
 		if strings.Trim(component, ". ") == "" {
-			return "", false, invalidZIPPath(name)
+			return "", false, invalidZIPPath(name, "path contains a component made only of dots and spaces")
 		}
 	}
 	return clean, directory, nil
@@ -73,8 +81,8 @@ func hasDrivePrefix(name string) bool {
 		(('A' <= name[0] && name[0] <= 'Z') || ('a' <= name[0] && name[0] <= 'z'))
 }
 
-func invalidZIPPath(name string) error {
-	return fmt.Errorf("%w: %q", ErrIllegalDir, name)
+func invalidZIPPath(name, reason string) error {
+	return fmt.Errorf("%w: %q: %s", ErrIllegalDir, name, reason)
 }
 
 // waitForEntry waits for the active writer to close. The caller holds z.mu.
@@ -91,7 +99,11 @@ func (z *ZIP) waitForEntry() error {
 	return nil
 }
 
-// Create creates a new file in the zip archive.
+// Create creates a new file in the ZIP archive, waiting for any active entry
+// to close. The caller must close the returned writer when done.
+// Both / and backslash are path separators on every OS.
+// Rejected names wrap [ErrIllegalDir]. With a valid name, Create returns
+// [os.ErrClosed] after an owned archive has closed.
 func (z *ZIP) Create(filename string) (io.WriteCloser, error) {
 	name, _, err := normalizeZIPPath(filename)
 	if err != nil {
@@ -172,14 +184,19 @@ func (*ZIP) dirpath(dir string) []string {
 	return ret
 }
 
-// WriteFile writes the given data to the given filename in the zip archive.
+// WriteFile writes data to a ZIP entry, waiting for any active entry to close.
+// Both / and backslash are path separators on every OS. A trailing separator
+// denotes a directory entry, which must have empty data.
+// Rejected names and directory entries with data wrap [ErrIllegalDir].
+// With valid arguments, WriteFile returns [os.ErrClosed] after an owned archive
+// has closed.
 func (z *ZIP) WriteFile(filename string, data []byte, _ os.FileMode) error {
 	name, directory, err := normalizeZIPPath(filename)
 	if err != nil {
 		return err
 	}
 	if directory && len(data) != 0 {
-		return invalidZIPPath(filename)
+		return invalidZIPPath(filename, "directory entry cannot have data")
 	}
 	z.mu.Lock()
 	defer z.mu.Unlock()

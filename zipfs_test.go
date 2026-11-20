@@ -154,25 +154,55 @@ func TestCreateConcurrency(t *testing.T) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	z := NewZIP(zw)
+	const entryCount = 16
+	const payloadSize = 1 << 20
+	random := mrand.New(mrand.NewSource(90))
+	payloads := make([][]byte, entryCount)
+	expected := make(map[string][]byte, entryCount)
+	for i := range payloads {
+		payloads[i] = make([]byte, payloadSize)
+		_, err := random.Read(payloads[i])
+		require.NoError(t, err)
+		expected[fmt.Sprintf("file%d", i)] = payloads[i]
+	}
+
+	entry0, err := z.Create("file0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = entry0.Close() })
+
 	var workers sync.WaitGroup
-	start := make(chan struct{})
-	expected := make(map[string]string)
-	for i := range 16 {
-		name := fmt.Sprintf("file%d", i)
-		content := fmt.Sprintf("content for entry %d", i)
-		expected[name] = content
+	results := make(chan error, entryCount-1)
+	for i := 1; i < entryCount; i++ {
 		workers.Go(func() {
-			<-start
-			w, err := z.Create(name)
-			if assert.NoError(t, err) {
-				_, err := io.WriteString(w, content)
-				assert.NoError(t, err)
-				assert.NoError(t, w.Close())
+			w, err := z.Create(fmt.Sprintf("file%d", i))
+			if err != nil {
+				results <- err
+				return
 			}
+			_, err = io.Copy(w, bytes.NewReader(payloads[i]))
+			results <- errors.Join(err, w.Close())
 		})
 	}
-	close(start)
-	workers.Wait()
+	require.True(t, waitForZIPStacks("(*ZIP).Create(", "sync.Cond.Wait", entryCount-1),
+		"ZIP Create workers did not reach the entry wait")
+	_, err = io.Copy(entry0, bytes.NewReader(payloads[0]))
+	require.NoError(t, err)
+	require.NoError(t, entry0.Close())
+
+	done := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("ZIP Create workers did not finish within 30 seconds")
+	}
+	close(results)
+	for err := range results {
+		require.NoError(t, err)
+	}
 	require.NoError(t, zw.Close())
 	zr, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
 	require.NoError(t, err)
@@ -185,7 +215,7 @@ func TestCreateConcurrency(t *testing.T) {
 		data, err := io.ReadAll(r)
 		require.NoError(t, r.Close())
 		require.NoError(t, err)
-		require.Equal(t, want, string(data))
+		require.Equal(t, want, data)
 		delete(expected, f.Name)
 	}
 }
@@ -454,14 +484,32 @@ func TestZIP_EntryNames(t *testing.T) {
 				_, err = io.WriteString(w, "data")
 				return errors.Join(err, w.Close())
 			}
-			for _, name := range []string{"", "./", "a/..", "/x", "../x", "a/../../x", "C:x", "x: todo.txt", "a/../C:x", "a\x00b", ".. /x", ".../x", "a/.. /b"} {
-				err := write(name)
+			rejected := []struct {
+				name   string
+				reason string
+			}{
+				{"", "path resolves to the archive root"},
+				{"./", "path resolves to the archive root"},
+				{"a/..", "path resolves to the archive root"},
+				{"/x", "rooted path"},
+				{"../x", "path escapes the archive root"},
+				{"a/../../x", "path escapes the archive root"},
+				{"C:x", "drive-qualified path"},
+				{"x: todo.txt", "drive-qualified path"},
+				{"a/../C:x", "drive-qualified path"},
+				{"a\x00b", "path contains a NUL byte"},
+				{".. /x", "path contains a component made only of dots and spaces"},
+				{".../x", "path contains a component made only of dots and spaces"},
+				{"a/.. /b", "path contains a component made only of dots and spaces"},
+			}
+			for _, tc := range rejected {
+				err := write(tc.name)
 				require.ErrorIs(t, err, ErrIllegalDir)
-				require.ErrorContains(t, err, fmt.Sprintf("%q", name))
+				require.ErrorContains(t, err, fmt.Sprintf("%q: %s", tc.name, tc.reason))
 			}
 			err := z.WriteFile("nonempty/", []byte("data"), 0)
 			require.ErrorIs(t, err, ErrIllegalDir)
-			require.ErrorContains(t, err, `"nonempty/"`)
+			require.ErrorContains(t, err, `"nonempty/": directory entry cannot have data`)
 			for _, name := range []string{`dir\nested\file.txt`, "12:30 standup.txt", "..notes"} {
 				require.NoError(t, write(name))
 			}
