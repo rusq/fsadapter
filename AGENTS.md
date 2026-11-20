@@ -13,7 +13,7 @@ Use Go 1.25 or newer, as declared in `go.mod`. Run these commands from the repos
 - `go test -race ./...` checks for data races when changing ZIP locking or writer lifecycle code.
 - `go generate ./...` refreshes the mock after an `FSCloser` change. Put `mockgen` v0.6.0 on your PATH first.
 
-The GitHub Actions workflow runs the build and test commands on Ubuntu. Its setup step specifies Go 1.24, while the module declares Go 1.25.
+The GitHub Actions workflow runs the build and test commands on Ubuntu and reads the Go version from `go.mod`.
 
 ## Coding Style
 
