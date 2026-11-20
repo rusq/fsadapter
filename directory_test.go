@@ -54,6 +54,13 @@ func TestDirectory_Create(t *testing.T) {
 			false,
 		},
 		{
+			"filename starts with two dots",
+			fields{dir: tmpdir},
+			args{"..notes"},
+			[]byte("123"),
+			false,
+		},
+		{
 			"directory (error)",
 			fields{dir: tmpdir},
 			args{""},
@@ -302,6 +309,12 @@ func TestDirectory_WriteFile(t *testing.T) {
 			"all ok",
 			fields{dir: tmpdir},
 			args{"blah.txt", []byte("blah"), 0o640},
+			false,
+		},
+		{
+			"subdirectory starts with two dots",
+			fields{dir: tmpdir},
+			args{filepath.Join("..cache", "blah.txt"), []byte("blah"), 0o640},
 			false,
 		},
 		{

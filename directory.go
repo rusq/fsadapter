@@ -100,7 +100,7 @@ var ErrIllegalDir = errors.New("illegal file path reference outside of working d
 func (fs Directory) ensureSubdir(node string) error {
 	if rel, err := filepath.Rel(fs.dir, node); err != nil {
 		return err
-	} else if strings.HasPrefix(rel, "..") {
+	} else if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return ErrIllegalDir
 	}
 
