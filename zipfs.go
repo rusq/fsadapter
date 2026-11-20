@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,10 +21,15 @@ type ZIP struct {
 	mu     sync.Mutex
 	f      *os.File
 	seen   map[string]bool // seen holds the list of seen directories.
-	closed bool            // guarded by mu
+	active *syncWriter
+	cond   sync.Cond
+	closed bool // guarded by mu
 }
 
 func (z *ZIP) String() string {
+	if z.f == nil {
+		return "<zip archive>"
+	}
 	return fmt.Sprintf("<zip archive: %s>", z.f.Name())
 }
 
@@ -44,30 +48,72 @@ func NewZipFile(filename string) (*ZIP, error) {
 	return &ZIP{zw: zw, f: f, seen: make(map[string]bool)}, nil
 }
 
-// normalizePath reassembles the path in correct format for ZIP file.
-func (*ZIP) normalizePath(p string) string {
-	split := strings.Split(filepath.Clean(p), string(os.PathSeparator))
-	return path.Join(split...)
+// ErrEntryOpen reports that closing an archive opened with NewZipFile
+// finalized an entry before its writer was closed.
+var ErrEntryOpen = errors.New("ZIP archive closed with an open entry")
+
+func normalizeZIPPath(name string) (string, bool, error) {
+	slashed := strings.ReplaceAll(name, `\`, "/")
+	directory := strings.HasSuffix(slashed, "/")
+	clean := path.Clean(slashed)
+	if strings.HasPrefix(slashed, "/") || strings.ContainsRune(name, 0) ||
+		hasDrivePrefix(slashed) || hasDrivePrefix(clean) {
+		return "", false, invalidZIPPath(name)
+	}
+	for _, component := range strings.Split(clean, "/") {
+		if strings.Trim(component, ". ") == "" {
+			return "", false, invalidZIPPath(name)
+		}
+	}
+	return clean, directory, nil
+}
+
+func hasDrivePrefix(name string) bool {
+	return len(name) >= 2 && name[1] == ':' &&
+		(('A' <= name[0] && name[0] <= 'Z') || ('a' <= name[0] && name[0] <= 'z'))
+}
+
+func invalidZIPPath(name string) error {
+	return fmt.Errorf("%w: %q", ErrIllegalDir, name)
+}
+
+// waitForEntry waits for the active writer to close. The caller holds z.mu.
+func (z *ZIP) waitForEntry() error {
+	if z.cond.L == nil {
+		z.cond.L = &z.mu
+	}
+	for z.active != nil && !z.closed {
+		z.cond.Wait()
+	}
+	if z.closed {
+		return os.ErrClosed
+	}
+	return nil
 }
 
 // Create creates a new file in the zip archive.
 func (z *ZIP) Create(filename string) (io.WriteCloser, error) {
-	// reassemble path in correct format for ZIP file
-	// in case it uses OS specific path.
-	filename = z.normalizePath(filename)
-
-	z.mu.Lock() // mutex will be unlocked, when the user calls Close.
-	w, err := z.create(filename)
+	name, _, err := normalizeZIPPath(filename)
 	if err != nil {
-		z.mu.Unlock()
 		return nil, err
 	}
-	return &syncWriter{w: w, archiveMu: &z.mu}, nil
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	if err := z.waitForEntry(); err != nil {
+		return nil, err
+	}
+	w, err := z.create(name)
+	if err != nil {
+		return nil, err
+	}
+	entry := &syncWriter{z: z, w: w}
+	z.active = entry
+	return entry, nil
 }
 
 // create creates a new file in the zip archive.
 func (z *ZIP) create(filename string) (io.Writer, error) {
-	if err := z.ensureDir(filename); err != nil {
+	if err := z.ensureDir(strings.TrimSuffix(filename, "/")); err != nil {
 		return nil, err
 	}
 	header := &zip.FileHeader{
@@ -128,9 +174,30 @@ func (*ZIP) dirpath(dir string) []string {
 
 // WriteFile writes the given data to the given filename in the zip archive.
 func (z *ZIP) WriteFile(filename string, data []byte, _ os.FileMode) error {
+	name, directory, err := normalizeZIPPath(filename)
+	if err != nil {
+		return err
+	}
+	if directory && len(data) != 0 {
+		return invalidZIPPath(filename)
+	}
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	zf, err := z.create(filename)
+	if err := z.waitForEntry(); err != nil {
+		return err
+	}
+	if directory {
+		name += "/"
+		if z.seen[name] {
+			return nil
+		}
+		if _, err := z.create(name); err != nil {
+			return err
+		}
+		z.seen[name] = true
+		return nil
+	}
+	zf, err := z.create(name)
 	if err != nil {
 		return err
 	}
@@ -140,7 +207,10 @@ func (z *ZIP) WriteFile(filename string, data []byte, _ os.FileMode) error {
 }
 
 // Close closes the underlying zip writer and the file handle.  It is only
-// necessary if ZIP was initialised using NewZipFile. Subsequent calls return nil.
+// necessary if ZIP was initialised using NewZipFile. Close waits for any
+// in-progress write, including slow or stalled underlying I/O. It finalizes
+// any open entry with the bytes written so far and reports ErrEntryOpen.
+// Subsequent calls return nil.
 func (z *ZIP) Close() error {
 	if !z.ourHandles() {
 		// we don't own the handles, so just bail out.
@@ -153,7 +223,21 @@ func (z *ZIP) Close() error {
 		return nil
 	}
 	z.closed = true
-	return z.closeHandles()
+	var entryErr error
+	if z.active != nil {
+		entryErr = ErrEntryOpen
+		z.active.closeErr = entryErr
+		z.active = nil
+	}
+	z.cond.Broadcast()
+	err := z.closeHandles()
+	if entryErr != nil {
+		if err != nil {
+			return errors.Join(entryErr, err)
+		}
+		return entryErr
+	}
+	return err
 }
 
 // closeHandles closes the underlying zip writer and the file handle.
@@ -174,37 +258,30 @@ func (z *ZIP) ourHandles() bool {
 	return z.f != nil
 }
 
-// syncWriter is a wrapper around an io.Writer that ensures that the underlying
-// writer is only used by one process at a time.
+// syncWriter serializes entry operations through the archive mutex.
 type syncWriter struct {
-	w io.Writer // underlying writer
-
-	// zip writer can only process one file at a time, so any process that wants
-	// to Create the file will have to wait until Close is called:
-	//
-	// From zip.Create doc:  The file's contents must be written to the
-	// io.Writer before the next call to Create, CreateHeader, or Close.
-	archiveMu *sync.Mutex
-	mu        sync.Mutex
-	closed    bool
+	z        *ZIP
+	w        io.Writer
+	closeErr error // guarded by z.mu
 }
 
 func (sw *syncWriter) Write(p []byte) (int, error) {
-	sw.mu.Lock()
-	defer sw.mu.Unlock()
-	if sw.closed {
+	sw.z.mu.Lock()
+	defer sw.z.mu.Unlock()
+	if sw.z.active != sw || sw.z.closed {
 		return 0, errors.New("file already closed")
 	}
 	return sw.w.Write(p)
 }
 
 func (sw *syncWriter) Close() error {
-	sw.mu.Lock()
-	defer sw.mu.Unlock()
-	if sw.closed {
-		return nil
+	sw.z.mu.Lock()
+	defer sw.z.mu.Unlock()
+	if sw.z.active == sw && !sw.z.closed {
+		sw.z.active = nil
+		sw.z.cond.Broadcast()
 	}
-	sw.closed = true
-	sw.archiveMu.Unlock()
-	return nil
+	err := sw.closeErr
+	sw.closeErr = nil
+	return err
 }

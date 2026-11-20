@@ -4,10 +4,10 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/flate"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	mrand "math/rand"
 	"os"
 	"path/filepath"
@@ -63,8 +63,8 @@ func testsuiteZipFile(t *testing.T, zipFile, filename, content string) {
 	require.NoError(t, err)
 	_, err = io.Copy(hTest, strings.NewReader(content))
 	assert.NoError(t, err)
+	require.NoError(t, hTest.Close())
 	assert.NoError(t, z.Close())
-	// test file closed
 
 	assert.NoError(t, zw.Close())
 	assert.NoError(t, hArc.Close())
@@ -79,12 +79,12 @@ func assertZippedFileSize(t *testing.T, zipfile string, fullpath string, size ui
 	}
 	defer zr.Close()
 
-	zzz := ZIP{}
+	wantName := strings.ReplaceAll(fullpath, "\\", "/")
 
 	found := false
 	for _, f := range zr.File {
 		t.Log(f.Name)
-		if f.Name == zzz.normalizePath(fullpath) {
+		if f.Name == wantName {
 			if f.UncompressedSize64 != size {
 				t.Errorf("file: %s, size mismatch: want: %d, got %d", fullpath, size, f.UncompressedSize64)
 				return
@@ -151,89 +151,42 @@ func TestNewZIP(t *testing.T) {
 }
 
 func TestCreateConcurrency(t *testing.T) {
-	t.Parallel()
-	t.Run("issue#90", func(t *testing.T) {
-		t.Parallel()
-		// test for GH issue#90 - race condition in ZIP.Create
-		const (
-			numRoutines    = 16
-			testContentsSz = 1 * (1 << 20)
-		)
-
-		var buf bytes.Buffer
-		var wg sync.WaitGroup
-
-		zw := zip.NewWriter(&buf)
-		defer zw.Close()
-
-		fsa := NewZIP(zw)
-		defer fsa.Close()
-
-		// prepare workers
-		readySteadyGo := make(chan struct{})
-		panicAttacks := make(chan any, numRoutines)
-
-		for i := 0; i < numRoutines; i++ {
-			wg.Add(1)
-			go func(n int) {
-				defer func() {
-					if r := recover(); r != nil {
-						panicAttacks <- fmt.Sprintf("ZIP.Create race condition in gr %d: %v", n, r)
-					}
-				}()
-
-				defer wg.Done()
-				var contents bytes.Buffer
-				if _, err := io.CopyN(&contents, rand.Reader, testContentsSz); err != nil {
-					panic(err)
-				}
-
-				<-readySteadyGo
-				fw, err := fsa.Create(fmt.Sprintf("file%d", n))
-				if err != nil {
-					panic(err)
-				}
-				defer fw.Close()
-
-				if _, err := io.Copy(fw, &contents); err != nil {
-					panic(err)
-				}
-			}(i)
-		}
-		close(readySteadyGo)
-		wg.Wait()
-		close(panicAttacks)
-		for r := range panicAttacks {
-			if r != nil {
-				t.Error(r)
-			}
-		}
-	})
-}
-
-func TestZIP_normalizePath(t *testing.T) {
-	type args struct {
-		p string
-	}
-	tests := []struct {
-		name string
-		z    *ZIP
-		args args
-		want string
-	}{
-		{
-			"windows",
-			&ZIP{},
-			args{filepath.Join("sample", "directory", "and", "file.txt")},
-			"sample/directory/and/file.txt",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.z.normalizePath(tt.args.p); got != tt.want {
-				t.Errorf("ZIP.normalizePath() = %v, want %v", got, tt.want)
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	z := NewZIP(zw)
+	var workers sync.WaitGroup
+	start := make(chan struct{})
+	expected := make(map[string]string)
+	for i := range 16 {
+		name := fmt.Sprintf("file%d", i)
+		content := fmt.Sprintf("content for entry %d", i)
+		expected[name] = content
+		workers.Go(func() {
+			<-start
+			w, err := z.Create(name)
+			if assert.NoError(t, err) {
+				_, err := io.WriteString(w, content)
+				assert.NoError(t, err)
+				assert.NoError(t, w.Close())
 			}
 		})
+	}
+	close(start)
+	workers.Wait()
+	require.NoError(t, zw.Close())
+	zr, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+	require.Len(t, zr.File, len(expected))
+	for _, f := range zr.File {
+		want, ok := expected[f.Name]
+		require.True(t, ok, "unexpected or duplicate entry %q", f.Name)
+		r, err := f.Open()
+		require.NoError(t, err)
+		data, err := io.ReadAll(r)
+		require.NoError(t, r.Close())
+		require.NoError(t, err)
+		require.Equal(t, want, string(data))
+		delete(expected, f.Name)
 	}
 }
 
@@ -273,24 +226,6 @@ func TestZIP_dirpath(t *testing.T) {
 			}
 		})
 	}
-}
-
-func Test_syncWriter_Close(t *testing.T) {
-	t.Run("should unlock the mutex", func(t *testing.T) {
-		sw := syncWriter{archiveMu: &sync.Mutex{}}
-
-		sw.archiveMu.Lock()
-
-		sw.Close()
-		assert.True(t, sw.archiveMu.TryLock())
-		assert.True(t, sw.closed)
-	})
-	t.Run("closing more than once does not panic", func(_ *testing.T) {
-		sw := syncWriter{archiveMu: &sync.Mutex{}}
-		sw.archiveMu.Lock()
-		sw.Close()
-		sw.Close()
-	})
 }
 
 func TestZIPCreateRecoversFromError(t *testing.T) {
@@ -345,14 +280,17 @@ func TestZIPCloseFinalizationFailure(t *testing.T) {
 				return 0, finalizeErr
 			})))
 			z.f = f
+			w, err := z.Create("open.txt")
+			require.NoError(t, err)
 
 			err = z.Close()
+			require.ErrorIs(t, err, ErrEntryOpen)
+			require.ErrorIs(t, w.Close(), ErrEntryOpen)
 			require.ErrorIs(t, err, finalizeErr)
 			require.NoError(t, z.Close())
 			if fileAlreadyClosed {
 				require.ErrorIs(t, err, os.ErrClosed)
 			} else {
-				require.Equal(t, finalizeErr, err)
 				_, err = f.Stat()
 				require.ErrorIs(t, err, os.ErrClosed)
 			}
@@ -360,51 +298,196 @@ func TestZIPCloseFinalizationFailure(t *testing.T) {
 	}
 }
 
+func waitForZIPStacks(frame, reason string, count int) bool {
+	stackBuffer := make([]byte, 64<<10)
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); runtime.Gosched() {
+		n := runtime.Stack(stackBuffer, true)
+		if n == len(stackBuffer) {
+			stackBuffer = make([]byte, len(stackBuffer)*2)
+			continue
+		}
+		found := 0
+		for _, stack := range strings.Split(string(stackBuffer[:n]), "\n\n") {
+			if strings.Contains(stack, "["+reason+"]") && strings.Contains(stack, frame) {
+				found++
+			}
+		}
+		if found >= count {
+			return true
+		}
+	}
+	return false
+}
+
 func TestSyncWriterConcurrentClose(t *testing.T) {
-	var archiveMu sync.Mutex
-	archiveMu.Lock()
+	_, z := gimmeZIP(t, t.TempDir())
 	writeStarted := make(chan struct{})
 	finishWrite := make(chan struct{})
-	sw := &syncWriter{
-		archiveMu: &archiveMu,
-		w: zipTestWriter(func(p []byte) (int, error) {
-			close(writeStarted)
-			<-finishWrite
-			return len(p), nil
-		}),
-	}
+	entry := &syncWriter{z: z, w: zipTestWriter(func(p []byte) (int, error) {
+		close(writeStarted)
+		<-finishWrite
+		return len(p), nil
+	})}
+	z.active = entry
 	writeDone := make(chan error, 1)
 	go func() {
-		_, err := sw.Write([]byte("entry"))
+		_, err := entry.Write([]byte("entry"))
 		writeDone <- err
 	}()
 	<-writeStarted
 
-	var closes sync.WaitGroup
-	for range 8 {
-		closes.Go(func() { assert.NoError(t, sw.Close()) })
-	}
-	blocked := assert.Eventually(t, func() bool {
-		buf := make([]byte, 64<<10)
-		n := runtime.Stack(buf, true)
-		for _, stack := range strings.Split(string(buf[:n]), "\n\n") {
-			if strings.Contains(stack, "[sync.Mutex.Lock]") &&
-				strings.Contains(stack, "(*syncWriter).Close(") {
-				return true
-			}
-		}
-		return false
-	}, time.Second, time.Millisecond, "no Close call blocked on the entry mutex")
-	if blocked && archiveMu.TryLock() {
-		archiveMu.Unlock()
-		t.Error("archive lock was released during the write")
-	}
+	closed := make(chan error, 1)
+	go func() { closed <- z.Close() }()
+	blocked := waitForZIPStacks("(*ZIP).Close(", "sync.Mutex.Lock", 1)
 	close(finishWrite)
 	require.NoError(t, <-writeDone)
-	closes.Wait()
+	require.ErrorIs(t, <-closed, ErrEntryOpen)
+	require.True(t, blocked, "ZIP.Close must block until the in-flight Write returns")
 
-	require.True(t, archiveMu.TryLock(), "Close did not release the archive lock")
-	defer archiveMu.Unlock()
-	_, err := sw.Write([]byte("closed"))
+	var closes sync.WaitGroup
+	results := make(chan error, 8)
+	for range cap(results) {
+		closes.Go(func() { results <- entry.Close() })
+	}
+	closes.Wait()
+	close(results)
+	var invalidated int
+	for err := range results {
+		if err != nil {
+			require.ErrorIs(t, err, ErrEntryOpen)
+			invalidated++
+		}
+	}
+	require.Equal(t, 1, invalidated)
+}
+
+func TestZIP_EntryWaiters(t *testing.T) {
+	for _, archiveClose := range []bool{false, true} {
+		t.Run(fmt.Sprintf("archive close=%t", archiveClose), func(t *testing.T) {
+			_, z := gimmeZIP(t, t.TempDir())
+			t.Cleanup(func() { _ = z.Close() })
+			entry, err := z.Create("active.txt")
+			require.NoError(t, err)
+
+			done := make(chan error, 4)
+			for i := range cap(done) {
+				go func() {
+					w, err := z.Create(fmt.Sprintf("waiting%d.txt", i))
+					if err == nil {
+						err = w.Close()
+					}
+					done <- err
+				}()
+			}
+			require.True(t, waitForZIPStacks("(*ZIP).Create(", "sync.Cond.Wait", cap(done)))
+			invalid := make(chan error, 1)
+			go func() {
+				_, err := z.Create("")
+				invalid <- err
+			}()
+			require.ErrorIs(t, zipResult(t, invalid), ErrIllegalDir)
+			go func() { invalid <- z.WriteFile("./", nil, 0) }()
+			require.ErrorIs(t, zipResult(t, invalid), ErrIllegalDir)
+			if archiveClose {
+				require.ErrorIs(t, z.Close(), ErrEntryOpen)
+			} else {
+				require.NoError(t, entry.Close())
+			}
+			for range cap(done) {
+				if archiveClose {
+					require.ErrorIs(t, zipResult(t, done), os.ErrClosed)
+				} else {
+					require.NoError(t, zipResult(t, done))
+				}
+			}
+		})
+	}
+}
+
+func zipResult(t *testing.T, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Fatal("ZIP operation did not return")
+		return nil
+	}
+}
+
+func TestZIP_CloseOpenEntry(t *testing.T) {
+	filename, z := gimmeZIP(t, t.TempDir())
+	entry, err := z.Create("active.txt")
+	require.NoError(t, err)
+	_, err = io.WriteString(entry, "written so far")
+	require.NoError(t, err)
+	require.ErrorIs(t, z.Close(), ErrEntryOpen)
+	require.NoError(t, z.Close())
+	_, err = io.WriteString(entry, "late write")
 	require.ErrorContains(t, err, "file already closed")
+	require.ErrorIs(t, entry.Close(), ErrEntryOpen)
+	require.NoError(t, entry.Close())
+	_, err = z.Create("after.txt")
+	require.ErrorIs(t, err, os.ErrClosed)
+	require.ErrorIs(t, z.WriteFile("after.txt", nil, 0), os.ErrClosed)
+
+	zr, err := zip.OpenReader(filename)
+	require.NoError(t, err)
+	defer zr.Close()
+	data, err := fs.ReadFile(zr, "active.txt")
+	require.NoError(t, err)
+	require.Equal(t, "written so far", string(data))
+}
+
+func TestZIP_EntryNames(t *testing.T) {
+	for _, create := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Create=%t", create), func(t *testing.T) {
+			filename, z := gimmeZIP(t, t.TempDir())
+			write := func(name string) error {
+				if !create {
+					return z.WriteFile(name, []byte("data"), 0)
+				}
+				w, err := z.Create(name)
+				if err != nil {
+					return err
+				}
+				_, err = io.WriteString(w, "data")
+				return errors.Join(err, w.Close())
+			}
+			for _, name := range []string{"", "./", "a/..", "/x", "../x", "a/../../x", "C:x", "x: todo.txt", "a/../C:x", "a\x00b", ".. /x", ".../x", "a/.. /b"} {
+				err := write(name)
+				require.ErrorIs(t, err, ErrIllegalDir)
+				require.ErrorContains(t, err, fmt.Sprintf("%q", name))
+			}
+			err := z.WriteFile("nonempty/", []byte("data"), 0)
+			require.ErrorIs(t, err, ErrIllegalDir)
+			require.ErrorContains(t, err, `"nonempty/"`)
+			for _, name := range []string{`dir\nested\file.txt`, "12:30 standup.txt", "..notes"} {
+				require.NoError(t, write(name))
+			}
+			require.NoError(t, z.WriteFile("dir/", nil, 0))
+			require.NoError(t, z.WriteFile("empty/", nil, 0))
+			require.NoError(t, z.WriteFile(`empty\`, nil, 0))
+			require.NoError(t, z.Close())
+
+			zr, err := zip.OpenReader(filename)
+			require.NoError(t, err)
+			defer zr.Close()
+			var names []string
+			for _, f := range zr.File {
+				names = append(names, f.Name)
+			}
+			require.ElementsMatch(t, []string{"dir/", "dir/nested/", "dir/nested/file.txt", "12:30 standup.txt", "..notes", "empty/"}, names)
+			data, err := fs.ReadFile(zr, "dir/nested/file.txt")
+			require.NoError(t, err)
+			require.Equal(t, "data", string(data))
+		})
+	}
+}
+
+func TestZIP_String(t *testing.T) {
+	require.Equal(t, "<zip archive>", NewZIP(zip.NewWriter(io.Discard)).String())
+	filename, z := gimmeZIP(t, t.TempDir())
+	require.NoError(t, z.Close())
+	require.Equal(t, fmt.Sprintf("<zip archive: %s>", filename), z.String())
 }
