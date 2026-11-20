@@ -18,10 +18,11 @@ var _ FSCloser = &ZIP{}
 
 // ZIP is a filesystem adapter for zip files.
 type ZIP struct {
-	zw   *zip.Writer
-	mu   sync.Mutex
-	f    *os.File
-	seen map[string]bool // seen holds the list of seen directories.
+	zw     *zip.Writer
+	mu     sync.Mutex
+	f      *os.File
+	seen   map[string]bool // seen holds the list of seen directories.
+	closed bool            // guarded by mu
 }
 
 func (z *ZIP) String() string {
@@ -139,7 +140,7 @@ func (z *ZIP) WriteFile(filename string, data []byte, _ os.FileMode) error {
 }
 
 // Close closes the underlying zip writer and the file handle.  It is only
-// necessary if ZIP was initialised using NewZipFile
+// necessary if ZIP was initialised using NewZipFile. Subsequent calls return nil.
 func (z *ZIP) Close() error {
 	if !z.ourHandles() {
 		// we don't own the handles, so just bail out.
@@ -148,6 +149,10 @@ func (z *ZIP) Close() error {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 
+	if z.closed {
+		return nil
+	}
+	z.closed = true
 	return z.closeHandles()
 }
 

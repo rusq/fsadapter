@@ -12,9 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,6 +30,7 @@ func TestNewZipFile(t *testing.T) {
 		assert.NotNil(t, zf.zw)
 		assert.NotNil(t, zf.f)
 
+		require.NoError(t, zf.Close())
 		require.NoError(t, zf.Close())
 		require.FileExists(t, zipPath)
 	})
@@ -345,6 +348,7 @@ func TestZIPCloseFinalizationFailure(t *testing.T) {
 
 			err = z.Close()
 			require.ErrorIs(t, err, finalizeErr)
+			require.NoError(t, z.Close())
 			if fileAlreadyClosed {
 				require.ErrorIs(t, err, os.ErrClosed)
 			} else {
@@ -376,16 +380,22 @@ func TestSyncWriterConcurrentClose(t *testing.T) {
 	}()
 	<-writeStarted
 
-	if sw.mu.TryLock() {
-		sw.mu.Unlock()
-		t.Error("entry lock was available during the write")
-	}
-
 	var closes sync.WaitGroup
 	for range 8 {
 		closes.Go(func() { assert.NoError(t, sw.Close()) })
 	}
-	if archiveMu.TryLock() {
+	blocked := assert.Eventually(t, func() bool {
+		buf := make([]byte, 64<<10)
+		n := runtime.Stack(buf, true)
+		for _, stack := range strings.Split(string(buf[:n]), "\n\n") {
+			if strings.Contains(stack, "[sync.Mutex.Lock]") &&
+				strings.Contains(stack, "(*syncWriter).Close(") {
+				return true
+			}
+		}
+		return false
+	}, time.Second, time.Millisecond, "no Close call blocked on the entry mutex")
+	if blocked && archiveMu.TryLock() {
 		archiveMu.Unlock()
 		t.Error("archive lock was released during the write")
 	}
