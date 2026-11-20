@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -59,9 +58,10 @@ func (z *ZIP) Create(filename string) (io.WriteCloser, error) {
 	z.mu.Lock() // mutex will be unlocked, when the user calls Close.
 	w, err := z.create(filename)
 	if err != nil {
+		z.mu.Unlock()
 		return nil, err
 	}
-	return &syncWriter{w: w, mu: &z.mu}, nil
+	return &syncWriter{w: w, archiveMu: &z.mu}, nil
 }
 
 // create creates a new file in the zip archive.
@@ -153,13 +153,15 @@ func (z *ZIP) Close() error {
 
 // closeHandles closes the underlying zip writer and the file handle.
 func (z *ZIP) closeHandles() error {
-	if err := z.zw.Close(); err != nil {
-		return err
+	zipErr := z.zw.Close()
+	fileErr := z.f.Close()
+	if zipErr == nil {
+		return fileErr
 	}
-	if z.f == nil {
-		return nil
+	if fileErr == nil {
+		return zipErr
 	}
-	return z.f.Close()
+	return errors.Join(zipErr, fileErr)
 }
 
 // ourHandles returns true if we own the file handle.
@@ -177,22 +179,27 @@ type syncWriter struct {
 	//
 	// From zip.Create doc:  The file's contents must be written to the
 	// io.Writer before the next call to Create, CreateHeader, or Close.
-	mu     *sync.Mutex
-	closed atomic.Bool
+	archiveMu *sync.Mutex
+	mu        sync.Mutex
+	closed    bool
 }
 
 func (sw *syncWriter) Write(p []byte) (int, error) {
-	if sw.closed.Load() {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	if sw.closed {
 		return 0, errors.New("file already closed")
 	}
 	return sw.w.Write(p)
 }
 
 func (sw *syncWriter) Close() error {
-	if sw.closed.Load() {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	if sw.closed {
 		return nil
 	}
-	sw.mu.Unlock()
-	sw.closed.Store(true)
+	sw.closed = true
+	sw.archiveMu.Unlock()
 	return nil
 }

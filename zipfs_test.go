@@ -3,7 +3,9 @@ package fsadapter
 import (
 	"archive/zip"
 	"bytes"
+	"compress/flate"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand"
@@ -272,18 +274,127 @@ func TestZIP_dirpath(t *testing.T) {
 
 func Test_syncWriter_Close(t *testing.T) {
 	t.Run("should unlock the mutex", func(t *testing.T) {
-		sw := syncWriter{mu: &sync.Mutex{}}
+		sw := syncWriter{archiveMu: &sync.Mutex{}}
 
-		sw.mu.Lock()
+		sw.archiveMu.Lock()
 
 		sw.Close()
-		assert.True(t, sw.mu.TryLock())
-		assert.True(t, sw.closed.Load())
+		assert.True(t, sw.archiveMu.TryLock())
+		assert.True(t, sw.closed)
 	})
 	t.Run("closing more than once does not panic", func(_ *testing.T) {
-		sw := syncWriter{mu: &sync.Mutex{}}
-		sw.mu.Lock()
+		sw := syncWriter{archiveMu: &sync.Mutex{}}
+		sw.archiveMu.Lock()
 		sw.Close()
 		sw.Close()
 	})
+}
+
+func TestZIPCreateRecoversFromError(t *testing.T) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	z := NewZIP(zw)
+	createErr := errors.New("compressor unavailable")
+	zw.RegisterCompressor(zip.Deflate, func(io.Writer) (io.WriteCloser, error) {
+		return nil, createErr
+	})
+
+	w, err := z.Create("first.txt")
+	require.ErrorIs(t, err, createErr)
+	require.Nil(t, w)
+	require.True(t, z.mu.TryLock(), "failed Create left the archive locked")
+	z.mu.Unlock()
+
+	zw.RegisterCompressor(zip.Deflate, func(w io.Writer) (io.WriteCloser, error) {
+		return flate.NewWriter(w, flate.DefaultCompression)
+	})
+	require.NoError(t, z.WriteFile("second.txt", []byte("recovered"), 0o600))
+	require.NoError(t, zw.Close())
+
+	zr, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	require.NoError(t, err)
+	require.Len(t, zr.File, 1)
+	r, err := zr.File[0].Open()
+	require.NoError(t, err)
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, "recovered", string(data))
+}
+
+type zipTestWriter func([]byte) (int, error)
+
+func (w zipTestWriter) Write(p []byte) (int, error) {
+	return w(p)
+}
+
+func TestZIPCloseFinalizationFailure(t *testing.T) {
+	finalizeErr := errors.New("ZIP output failed")
+	for _, fileAlreadyClosed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("file already closed=%t", fileAlreadyClosed), func(t *testing.T) {
+			f, err := os.CreateTemp(t.TempDir(), "*.zip")
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = f.Close() })
+			if fileAlreadyClosed {
+				require.NoError(t, f.Close())
+			}
+			z := NewZIP(zip.NewWriter(zipTestWriter(func([]byte) (int, error) {
+				return 0, finalizeErr
+			})))
+			z.f = f
+
+			err = z.Close()
+			require.ErrorIs(t, err, finalizeErr)
+			if fileAlreadyClosed {
+				require.ErrorIs(t, err, os.ErrClosed)
+			} else {
+				require.Equal(t, finalizeErr, err)
+				_, err = f.Stat()
+				require.ErrorIs(t, err, os.ErrClosed)
+			}
+		})
+	}
+}
+
+func TestSyncWriterConcurrentClose(t *testing.T) {
+	var archiveMu sync.Mutex
+	archiveMu.Lock()
+	writeStarted := make(chan struct{})
+	finishWrite := make(chan struct{})
+	sw := &syncWriter{
+		archiveMu: &archiveMu,
+		w: zipTestWriter(func(p []byte) (int, error) {
+			close(writeStarted)
+			<-finishWrite
+			return len(p), nil
+		}),
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := sw.Write([]byte("entry"))
+		writeDone <- err
+	}()
+	<-writeStarted
+
+	if sw.mu.TryLock() {
+		sw.mu.Unlock()
+		t.Error("entry lock was available during the write")
+	}
+
+	var closes sync.WaitGroup
+	for range 8 {
+		closes.Go(func() { assert.NoError(t, sw.Close()) })
+	}
+	if archiveMu.TryLock() {
+		archiveMu.Unlock()
+		t.Error("archive lock was released during the write")
+	}
+	close(finishWrite)
+	require.NoError(t, <-writeDone)
+	closes.Wait()
+
+	require.True(t, archiveMu.TryLock(), "Close did not release the archive lock")
+	defer archiveMu.Unlock()
+	_, err := sw.Write([]byte("closed"))
+	require.ErrorContains(t, err, "file already closed")
 }
